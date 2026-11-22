@@ -1,0 +1,71 @@
+name: supply-chain
+# Reusable supply-chain scans for every runfix repo. Callers pin this file by commit SHA:
+#   uses: runfix-dev/.github/.github/workflows/supply-chain.yml@<sha> # main
+# Scanners run as digest-pinned images, so no third-party action code runs except actions/checkout.
+# Each job fails on any finding and on any scanner error (backend unreachable, no inputs).
+on:
+  workflow_call:
+    inputs:
+      osv-exclude:
+        description: "Space-separated directory globs osv-scanner skips (intentionally vulnerable fixtures only)"
+        type: string
+        default: ""
+permissions:
+  contents: read
+defaults:
+  run:
+    shell: bash
+jobs:
+  zizmor:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with: { persist-credentials: false }
+      - name: zizmor (workflow audit, online)
+        env: { GH_TOKEN: "${{ github.token }}" }
+        run: >
+          docker run --rm --user "$(id -u):$(id -g)" -e GH_TOKEN -e HOME=/tmp -v "$PWD:/src:ro"
+          ghcr.io/zizmorcore/zizmor:1.32.0@sha256:3014cc8f68f663935f69b3c3e0e41f5ce102b268d97db13db0f62208747f860d
+          --format github /src
+  osv-scanner:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with: { persist-credentials: false }
+      - name: osv-scanner (dependencies)
+        env: { OSV_EXCLUDE: "${{ inputs.osv-exclude }}" }
+        run: |
+          set -f; args=()
+          for g in $OSV_EXCLUDE; do args+=("--x-exclude=g:$g"); done
+          docker run --rm --user "$(id -u):$(id -g)" -e HOME=/tmp -v "$PWD:/src:ro" \
+            ghcr.io/google/osv-scanner:v2.7.1@sha256:a70ffffc2bfd33482953e5d6b64c6fcdb30239717a07b0f0d3ab2859ce3e4cde \
+            scan source -r --allow-no-lockfiles "${args[@]}" /src
+  gitleaks:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with: { persist-credentials: false, fetch-depth: 0 }
+      # Scans every commit reachable from HEAD (the PR merge commit, or main on push), not other
+      # branches, so one branch's result never depends on another branch's commits.
+      # gitleaks exits 0 with "0 commits scanned" when git itself fails (dubious ownership, not a
+      # repository), so the step also fails on any gitleaks error line or an empty scan.
+      - name: gitleaks (full history of HEAD, redacted)
+        run: |
+          log="$(mktemp)"
+          rc=0
+          docker run --rm --user "$(id -u):$(id -g)" -e HOME=/tmp -v "$PWD:/src:ro" \
+            ghcr.io/gitleaks/gitleaks:v8.30.1@sha256:c00b6bd0aeb3071cbcb79009cb16a60dd9e0a7c60e2be9ab65d25e6bc8abbb7f \
+            git /src --log-opts=HEAD --redact --verbose --no-color --no-banner --exit-code 1 2>&1 | tee "$log" || rc=$?
+          if grep -qE ' (ERR|FTL) ' "$log"; then
+            echo "::error::gitleaks reported an error; the scan is not trustworthy"
+            exit 1
+          fi
+          scanned="$(sed -nE 's/.* ([0-9]+) commits scanned.*/\1/p' "$log" | tail -n 1)"
+          if [ -z "$scanned" ] || [ "$scanned" -eq 0 ]; then
+            echo "::error::gitleaks scanned no commits"
+            exit 1
+          fi
+          exit "$rc"
