@@ -1,0 +1,10 @@
+name: self-scan
+on:
+  push: { branches: [main] }
+  pull_request: {}
+  schedule: [{ cron: "23 5 * * 1" }]
+permissions:
+  contents: read
+jobs:
+  scan:
+    uses: ./.github/workflows/supply-chain.yml # zizmor: ignore[self-repository] actionlint 1.7.12 rejects the newer $/ form
